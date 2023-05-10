@@ -1,0 +1,154 @@
+#include <iostream>
+#include <fstream>
+#include <cstdlib>
+#include <ctime>
+#include <chrono>
+#include <CL/cl.h>
+#include <mpi.h>
+#include <omp.h>
+
+using namespace std;
+
+int main(int argc, char** argv)
+{
+    int N;
+    int rank, size;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (rank == 0) {
+        cout << "Enter matrix size N: ";
+        cin >> N;
+    }
+
+    MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    //Allocate memory for matrices A, B, and C
+    int **A, **B, **C;
+    int *A_row, *B_row, *C_row;
+    int block_size = N / size;
+    A = new int*[block_size];
+    B = new int*[block_size];
+    C = new int*[block_size];
+    A_row = new int[N * block_size];
+    B_row = new int[N * block_size];
+    C_row = new int[N * block_size];
+
+    for (int i = 0; i < block_size; i++)
+    {
+        A[i] = &A_row[i * N];
+        B[i] = &B_row[i * N];
+        C[i] = &C_row[i * N];
+    }
+
+    //Initialize matrices A and B with random values
+    srand(time(NULL) + rank); // Use rank to seed the random number generator
+    for (int i = 0; i < block_size; i++)
+    {
+        for (int j = 0; j < N; j++)
+        {
+            A[i][j] = rand() % 10;
+            B[i][j] = rand() % 10;
+        }
+    }
+
+    //Perform matrix multiplication C = A * B
+    auto start = chrono::steady_clock::now();
+
+    // Scatter matrix A to all processes
+    MPI_Scatter(A_row, N * block_size, MPI_INT, MPI_IN_PLACE, N * block_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Broadcast matrix B to all processes
+    MPI_Bcast(B_row, N * block_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Get the OpenCL device and create a context and command queue
+    cl_device_id device_id;
+    cl_context context;
+    cl_command_queue queue;
+    clGetDeviceIDs(NULL, CL_DEVICE_TYPE_GPU, 1, &device_id, NULL);
+    context = clCreateContext(NULL, 1, &device_id, NULL, NULL, NULL);
+    queue = clCreateCommandQueue(context, device_id, 0, NULL);
+
+    // Create the OpenCL program from the kernel source
+   const char *kernel_source = 
+"_kernel void matrix_multiply(_global int* A, __global int* B, __global int* C, int N) \n"
+"{ \n"
+"    int i = get_global_id(0); \n"
+"    int j = get_global_id(1); \n"
+"    int k; \n"
+"    int sum = 0; \n"
+"    for (k = 0; k < N; k++) {\n"
+"        sum += A[i * N + k] * B[k * N + j];\n"
+"    }\n"
+"    C[i * N + j] = sum;\n"
+"} \n";
+ cl_program program = clCreateProgramWithSource(context, 1, &kernel_source, NULL, NULL);
+
+// Build the OpenCL program
+clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
+
+// Create the OpenCL kernel
+cl_kernel kernel = clCreateKernel(program, "matrix_multiply", NULL);
+
+// Set the kernel arguments
+cl_mem clA = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * N * block_size, A_row, NULL);
+cl_mem clB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * N * block_size, B_row, NULL);
+cl_mem clC = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * N * block_size, NULL, NULL);
+clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&clA);
+clSetKernelArg(kernel, 1, sizeof(cl_mem), (void*)&clB);
+clSetKernelArg(kernel, 2, sizeof(cl_mem), (void*)&clC);
+clSetKernelArg(kernel, 3, sizeof(int), (void*)&N);
+
+// Set the work-group size and global size
+size_t local_size[2] = {16, 16};
+size_t global_size[2] = {N, N};
+clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global_size, local_size, 0, NULL, NULL);
+
+// Read the result back from the device
+clEnqueueReadBuffer(queue, clC, CL_TRUE, 0, sizeof(int) * N * block_size, C_row, 0, NULL, NULL);
+
+auto end = chrono::steady_clock::now();
+
+// Gather the result matrix from all processes
+MPI_Gather(C_row, N * block_size, MPI_INT, C_row, N * block_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+if (rank == 0) {
+    //Print out the result matrix C
+    cout << "Matrix C:\n";
+    for (int i = 0; i < N; i++)
+    {
+        for (int j = 0; j < N; j++)
+        {
+            cout << C[i][j] << " ";
+        }
+        cout << endl;
+    }
+
+    //Print out the elapsed time
+    auto elapsed_time = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+    cout << "Elapsed time: " << elapsed_time << " milliseconds" << endl;
+}
+
+//Clean up OpenCL resources
+clReleaseMemObject(clA);
+clReleaseMemObject(clB);
+clReleaseMemObject(clC);
+clReleaseKernel(kernel);
+clReleaseProgram(program);
+clReleaseCommandQueue(queue);
+clReleaseContext(context);
+
+//Free memory allocated for matrices A, B, and C
+delete[] A;
+delete[] B;
+delete[] C;
+delete[] A_row;
+delete[] B_row;
+delete[] C_row;
+
+MPI_Finalize();
+
+return 0;
+}
